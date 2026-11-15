@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#F7F9FF" />
+  <title>Enhance — App</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body class="app-page">
+
+<div class="lp-blobs" aria-hidden="true">
+  <div class="blob blob-a"></div>
+  <div class="blob blob-c"></div>
+</div>
+
+<header class="lp-nav">
+  <div class="lp-nav-inner glass">
+    <a class="brand" href="./">
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="4" width="20" height="16" rx="5" fill="url(#ag)"/><path d="M10 9.2v5.6l4.6-2.8L10 9.2Z" fill="#fff"/><defs><linearGradient id="ag" x1="2" y1="4" x2="22" y2="20"><stop stop-color="#5B7CFF"/><stop offset="1" stop-color="#335CFF"/></linearGradient></defs></svg></span>
+      <span class="wordmark">Enhance</span>
+    </a>
+    <nav class="ap-tabs" id="apTabs">
+      <button class="ap-tab active" data-tab="create">Create</button>
+      <button class="ap-tab" data-tab="history">History</button>
+    </nav>
+    <a class="cta cta-sm" href="./">Home</a>
+  </div>
+</header>
+
+<main class="shell">
+
+  <section id="app">
+
+    <div id="tabCreate">
+
+      <section class="card" id="uploadCard">
+        <div class="dropzone" id="dropzone" tabindex="0">
+          <div class="dz-icon-wrap">
+            <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="3"/></svg>
+          </div>
+          <div class="dz-title" id="dzTitle">Drop your video here</div>
+          <div class="dz-sub" id="dzSub">or click to browse</div>
+          <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.mkv,.webm,.m4v,.avi,.ts" hidden />
+        </div>
+
+        <div class="file-chip hidden" id="fileChip">
+          <span class="chip-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="3"/></svg></span>
+          <span class="chip-name" id="chipName"></span>
+          <span class="chip-size" id="chipSize"></span>
+          <button class="chip-x" id="chipRemove" title="Remove">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+
+        <p class="field-label">QUALITY MODE</p>
+        <div class="seg" id="modeRow">
+          <label class="seg-item"><input type="radio" name="mode" value="fast" checked /><span class="seg-btn">Fast</span></label>
+        </div>
+        <p class="seg-hint" id="segHint">GPU on your device when possible, cloud server otherwise</p>
+
+        <label class="look-row">
+          <input type="checkbox" id="cinematicLook" checked />
+          <span class="look-body"><strong>Cinematic look</strong><small>Pro color grade · deep blacks · rich color · max sharpness</small></span>
+          <span class="switch" aria-hidden="true"></span>
+        </label>
+
+        <button class="cta" id="goBtn" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z"/></svg>
+          <span>Enhance video</span>
+        </button>
+
+        <div id="uploadProgressWrap" class="progress hidden">
+          <div class="bar"><div id="uploadBar"></div></div>
+          <div class="meta" id="uploadMeta">Uploading…</div>
+        </div>
+      </section>
+
+      <section class="card" id="queueCard">
+        <div class="card-head">
+          <div>
+            <p class="sechead">In the studio</p>
+            <p class="secsub">Your clips while they're being graded</p>
+          </div>
+          <span class="pill" id="queuePill"></span>
+        </div>
+        <div class="jobs" id="jobsList"></div>
+      </section>
+
+      <section class="card" id="latestCard">
+        <div class="card-head">
+          <div>
+            <p class="sechead">Ready to download</p>
+            <p class="secsub">Your latest finished video — watch, compare, save</p>
+          </div>
+        </div>
+        <div class="jobs" id="latestDone"></div>
+      </section>
+
+    </div>
+
+    <div id="tabHistory" class="hidden">
+
+      <section class="card" id="historyCard">
+        <div class="card-head">
+          <div>
+            <p class="sechead">History</p>
+            <p class="secsub">Finished videos — watch, compare, download</p>
+          </div>
+          <span class="pill" id="histCountPill"></span>
+        </div>
+        <div class="jobs" id="histList"></div>
+      </section>
+
+    </div>
+
+    <footer class="fine">Files auto-delete 24 hours after they finish · Max <span id="limMb">—</span> MB / <span id="limMin">—</span> per video</footer>
+  </section>
+</main>
+<div id="toast" class="toast hidden"></div>
+<script src="./app.js"></script>
+</body>
+</html>

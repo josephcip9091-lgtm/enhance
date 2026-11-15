@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enhance — cinematic video, right in your browser</title>
+<meta name="description" content="Give any video the cinematic look — rich color, deep blacks, maximum sharpness. Runs 100% in your browser. Nothing is uploaded.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+  <div class="brand">Enhance</div>
+  <span class="engine-mode" id="engineMode"></span>
+</nav>
+
+<main>
+  <section class="hero">
+    <div class="badge">Runs 100% in your browser · nothing is uploaded</div>
+    <h1>Turn any video<br><span class="grad">cinematic.</span></h1>
+    <p>Pro color grade · deep blacks · rich color · maximum sharpness.<br>
+       The whole engine runs on your device — your video never touches a server.</p>
+  </section>
+
+  <section class="card" id="appCard">
+    <div class="drop" id="drop" tabindex="0">
+      <input type="file" id="file" accept="video/*" hidden>
+      <div class="drop-ic">🎬</div>
+      <div class="drop-t">Drop a video here</div>
+      <div class="drop-s">or click to choose · MP4, MOV, WebM</div>
+    </div>
+
+    <div class="chip hidden" id="chip">
+      <div class="chip-info">
+        <div class="chip-name" id="chipName"></div>
+        <div class="chip-meta" id="chipMeta"></div>
+        <div class="chip-warn hidden" id="chipWarn">Long clip — only the first 90 seconds will be enhanced (browser memory limit).</div>
+      </div>
+      <button class="x" id="clearBtn" title="Choose another video">✕</button>
+    </div>
+
+    <button class="btn hidden" id="goBtn">Enhance video</button>
+
+    <label class="opt hidden" id="optRow"><input type="checkbox" id="fps120"> Smooth motion — 120 fps <span class="opt-sub">(very slow — desktop recommended)</span></label>
+
+    <div class="prog hidden" id="progWrap">
+      <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
+      <div class="prog-label" id="progLabel"></div>
+    </div>
+
+    <div class="status hidden" id="status"></div>
+    <details class="logs hidden" id="logsWrap"><summary>Technical details</summary><pre id="logs"></pre></details>
+
+    <div class="result hidden" id="result">
+      <h2>Done — compare &amp; download</h2>
+      <div class="cmp" id="cmp">
+        <img id="imgBefore" alt="Before">
+        <div class="cmp-after" id="cmpAfter"><img id="imgAfter" alt="After"></div>
+        <input type="range" id="cmpSlider" min="0" max="100" value="50">
+        <span class="cmp-tag l">Before</span>
+        <span class="cmp-tag r">After</span>
+      </div>
+      <video id="outVid" controls playsinline></video>
+      <a class="btn dl" id="dlBtn" download>Download enhanced video</a>
+      <button class="ghost" id="againBtn">Enhance another video</button>
+    </div>
+
+    <div class="history hidden" id="historyWrap">
+      <h3>Recent results — saved on this device</h3>
+      <div id="historyList"></div>
+    </div>
+  </section>
+
+  <p class="fine" id="fine">Tip: short clips work best — phones may need several minutes. Keep this tab open while it runs.</p>
+  <a class="join hidden" id="joinLink" target="_blank" rel="noopener">Join the Enhance community — updates &amp; support →</a>
+</main>
+
+<footer>Enhance — private by design. Your video never leaves your device.</footer>
+
+<script src="vendor/ffmpeg.js"></script>
+<script src="vendor/turbo/mp4-muxer.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const u = p => new URL(p, location.href).href;
+const ISOLATED = self.crossOriginIsolated;
+const MAX_SECONDS = 90;
+const WHOP_JOIN_URL = "";
+
+const drop = $("drop"), fileIn = $("file"), chip = $("chip"), chipName = $("chipName"),
+      chipMeta = $("chipMeta"), chipWarn = $("chipWarn"), goBtn = $("goBtn"),
+      progWrap = $("progWrap"), progFill = $("progFill"), progLabel = $("progLabel"),
+      status = $("status"), logsWrap = $("logsWrap"), logsEl = $("logs"), result = $("result");
+
+let curPct = 0;
+let ffmpeg = null, loaded = false, file = null, meta = null;
+let encoding = false, logs = [], turboMod = null;
+let urlOut = null, urlBefore = null, urlAfter = null, blobOut = null;
+
+const TURBO = (function () {
+  try {
+    return "VideoDecoder" in window && "VideoEncoder" in window && "AudioEncoder" in window &&
+      !!document.createElement("canvas").getContext("webgl2");
+  } catch (e) { return false; }
+})();
+$("engineMode").textContent = TURBO
+  ? "Engine: Turbo (GPU-accelerated)"
+  : ISOLATED
+    ? "Engine: multi-thread (fast)"
+    : "Engine: single-thread (slower — open this page in its own tab for full speed)";
+if (WHOP_JOIN_URL) {
+  const j = $("joinLink");
+  j.href = WHOP_JOIN_URL;
+  j.classList.remove("hidden");
+}
+if (navigator.maxTouchPoints > 1 && Math.min(screen.width, screen.height) < 500)
+  $("fine").textContent = "Phone mode: only short clips (under ~30 s) are realistic here. A computer handles longer ones.";
+
+function setBar(pct, label) {
+  curPct = pct;
+  progWrap.classList.remove("hidden");
+  progFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  progLabel.textContent = label;
+}
+
+function showStatus(msg, isErr) {
+  status.classList.remove("hidden");
+  status.textContent = msg;
+  status.classList.toggle("err", !!isErr);
+  if (isErr && logs.length) {
+    logsWrap.classList.remove("hidden");
+    logsEl.textContent = logs.slice(-40).join("\n");
+  }
+}
+
+drop.addEventListener("click", () => fileIn.click());
+drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") fileIn.click(); });
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  if (e.dataTransfer.files.length) pick(e.dataTransfer.files[0]);
+});
+fileIn.addEventListener("change", () => { if (fileIn.files.length) pick(fileIn.files[0]); });
+$("clearBtn").addEventListener("click", reset);
+$("againBtn").addEventListener("click", () => location.reload());
+goBtn.addEventListener("click", run);
+
+function pick(f) {
+  if (!f.type.startsWith("video/") && !/\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(f.name)) {
+    showStatus("That's not a video file.", true);
+    return;
+  }
+  file = f;
+  const v = document.createElement("video");
+  v.preload = "metadata";
+  v.onloadedmetadata = () => {
+    meta = { dur: v.duration, w: v.videoWidth, h: v.videoHeight };
+    URL.revokeObjectURL(v.src);
+    chip.classList.remove("hidden");
+    drop.classList.add("hidden");
+    goBtn.classList.remove("hidden");
+    status.classList.add("hidden");
+    chipName.textContent = f.name;
+    chipMeta.textContent = (meta.w || "?") + "×" + (meta.h || "?") + " · " + meta.dur.toFixed(1) + " s · " + (f.size / 1048576).toFixed(1) + " MB";
+    const cap = maxSeconds();
+    chipWarn.classList.toggle("hidden", meta.dur <= cap);
+    chipWarn.textContent = "Long clip — only the first " + cap + " seconds will be enhanced (browser memory limit).";
+    $("optRow").classList.remove("hidden");
+  };
+  v.onerror = () => { URL.revokeObjectURL(v.src); showStatus("Couldn't read that file — try a different format.", true); };
+  v.src = URL.createObjectURL(f);
+}
+
+function reset() {
+  file = null; meta = null;
+  chip.classList.add("hidden");
+  goBtn.classList.add("hidden");
+  $("optRow").classList.add("hidden");
+  drop.classList.remove("hidden");
+  status.classList.add("hidden");
+  logsWrap.classList.add("hidden");
+  fileIn.value = "";
+}
+
+async function ensureLoaded() {
+  if (loaded) return;
+  const { FFmpeg } = FFmpegWASM;
+  ffmpeg = new FFmpeg();
+  ffmpeg.on("log", ({ message }) => { logs.push(message); if (logs.length > 80) logs.shift(); });
+  ffmpeg.on("progress", ({ progress }) => {
+    if (encoding && progress >= 0 && progress <= 1)
+      setBar(35 + progress * 55, "Enhancing… " + Math.round(progress * 100) + "% — keep this tab open");
+  });
+  setBar(4, "Loading engine… (first time only)");
+  const tick = setInterval(() => setBar(Math.min(18, curPct + 2), "Loading engine… (first time only)"), 900);
+  try {
+    if (ISOLATED) {
+      await ffmpeg.load({
+        coreURL: u("vendor/ffmpeg-core-mt.js"),
+        wasmURL: u("vendor/ffmpeg-core-mt.wasm"),
+        workerURL: u("vendor/ffmpeg-core-mt.worker.js")
+      });
+    } else {
+      await ffmpeg.load({
+        coreURL: u("vendor/ffmpeg-core-st.js"),
+        wasmURL: u("vendor/ffmpeg-core-st.wasm")
+      });
+    }
+    loaded = true;
+    setBar(20, "Engine ready");
+  } finally {
+    clearInterval(tick);
+  }
+}
+
+async function exec(args, pct, label) {
+  setBar(pct, label);
+  const rc = await ffmpeg.exec(args);
+  if (rc !== 0) throw new Error("ffmpeg exit code " + rc);
+}
+
+function frameStats(buf, w, h) {
+  const step = 3;
+  const gw = Math.floor(w / step), gh = Math.floor(h / step);
+  if (gw < 12 || gh < 12) return null;
+  let sum = 0, count = 0;
+  for (let yy = 0; yy < h; yy += 2) for (let xx = 0; xx < w; xx += 2) { sum += buf[yy * w + xx]; count++; }
+  const mean = sum / count;
+  const gx = (i, j) => buf[j * step * w + i * step];
+  const vals = [], grads = [];
+  for (let j = 3; j < gh - 3; j++) {
+    for (let i = 3; i < gw - 3; i++) {
+      const c = gx(i, j);
+      if (c < 18 || c > 238) continue;
+      let s25 = 0;
+      for (let dj = -2; dj <= 2; dj++) {
+        const rowBase = (j + dj) * step * w;
+        for (let di = -2; di <= 2; di++) s25 += buf[rowBase + (i + di) * step];
+      }
+      vals.push(Math.abs(c * 25 - s25));
+      grads.push(Math.abs(c - gx(i + 1, j)) + Math.abs(c - gx(i - 1, j)) + Math.abs(c - gx(i, j + 1)) + Math.abs(c - gx(i, j - 1)));
+    }
+  }
+  if (vals.length < 500) return null;
+  const idx = vals.map((v, k) => k).sort((a, b) => grads[a] - grads[b]);
+  const half = idx.length >> 1;
+  const flatVals = [];
+  for (let k = 0; k < half; k++) flatVals.push(vals[idx[k]]);
+  flatVals.sort((a, b) => a - b);
+  return { y: mean, noise: flatVals[flatVals.length >> 1] / 25 };
+}
+
+function brightLift(y) {
+  if (y == null) return 0.22;
+  if (y <= 90) return 0.22;
+  if (y < 150) return 0.22 * (1 - (y - 90) / 60);
+  if (y <= 190) return 0;
+  return -Math.min(0.12, (y - 190) / 110);
+}
+
+function brightContrast(y) {
+  if (y == null) return 1.24;
+  const t = Math.max(0, Math.min(1, (y - 140) / 80));
+  return 1.24 - 0.155 * t;
+}
+
+function brightSat(y) {
+  if (y == null) return 1.45;
+  const t = Math.max(0, Math.min(1, (y - 140) / 80));
+  return 1.45 - 0.15 * t;
+}
+
+function even(x) {
+  return Math.max(2, Math.round(x / 2) * 2);
+}
+
+function targets() {
+  const T = 1080;
+  const srcW = meta.w, srcH = meta.h;
+  const short = Math.min(srcW, srcH);
+  if (short >= T) return { outW: srcW, outH: srcH, needsScale: false };
+  const f = T / short;
+  let outW = even(srcW * f), outH = even(srcH * f);
+  const longEdge = Math.max(outW, outH);
+  if (longEdge > 3840) {
+    const down = 3840 / longEdge;
+    outW = even(outW * down);
+    outH = even(outH * down);
+  }
+  return { outW, outH, needsScale: true };
+}
+
+function maxSeconds() {
+  return Math.min(meta.w, meta.h) <= 1080 ? 180 : 90;
+}
+
+async function measureSource(inName, dur) {
+  const win = Math.min(Math.max(0.5, dur), 90);
+  const short = Math.min(meta.w, meta.h);
+  let w, h;
+  if (short <= 1080) { w = meta.w; h = meta.h; }
+  else if (meta.w < meta.h) { w = 1080; h = Math.round((meta.h * 1080) / meta.w); }
+  else { h = 1080; w = Math.round((meta.w * 1080) / meta.h); }
+  w = Math.round(w / 2) * 2; h = Math.round(h / 2) * 2;
+  const n = Math.max(6, Math.min(16, Math.round(win)));
+  const fps = n / win;
+  const wh = w * h, frameBytes = wh + Math.floor(wh / 2);
+  const logStart = logs.length;
+  const rc = await ffmpeg.exec(["-t", String(win), "-i", inName, "-vf", "fps=" + fps.toFixed(5) + ",scale=" + w + ":" + h + ":flags=bicubic", "-f", "rawvideo", "-pix_fmt", "yuv420p", "probe.yuv"]);
+  const recent = logs.slice(logStart).join("\n");
+  const fm = recent.match(/(\d+(?:\.\d+)?)\s*fps/);
+  if (fm) meta.fps = parseFloat(fm[1]);
+  if (rc !== 0) return null;
+  const raw = await ffmpeg.readFile("probe.yuv");
+  try { await ffmpeg.deleteFile("probe.yuv"); } catch (e) {}
+  if (!raw || raw.length < frameBytes) return null;
+  let ySum = 0, nSum = 0, cnt = 0;
+  const total = Math.floor(raw.length / frameBytes);
+  for (let i = 0; i < total; i++) {
+    const st = frameStats(raw.subarray(i * frameBytes, i * frameBytes + wh), w, h);
+    if (st) { ySum += st.y; nSum += st.noise; cnt++; }
+  }
+  return cnt ? { y: ySum / cnt, noise: nSum / cnt } : null;
+}
+
+function buildFilters(m, hasLut) {
+  if (hasLut) return "hqdn3d=2:2:4:4,lut3d=file=lut.cube,cas=0.55,scale=-2:min(1080,ih),format=yuv420p";
+  const noisy = m && m.noise != null && m.noise >= 1.4;
+  const y = m ? m.y : null;
+  const bright = y != null && y > 170;
+  const clar = noisy ? 0.4 : 0.75;
+  const f = [noisy ? "hqdn3d=4:4:8:8" : "hqdn3d=3:3:7:7", noisy ? "vaguedenoiser=threshold=3.5:method=soft" : "vaguedenoiser=threshold=2:method=soft"];
+  if ($("fps120").checked && (meta.fps || 30) < 118)
+    f.push("minterpolate=fps=120:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1");
+  const t = targets();
+  if (t.needsScale) f.push("scale=" + t.outW + ":" + t.outH + ":flags=lanczos");
+  f.push("unsharp=lx=21:ly=3:la=" + clar);
+  f.push("unsharp=lx=3:ly=21:la=" + clar);
+  f.push("cas=" + (bright ? (noisy ? 0.45 : 0.7) : noisy ? 0.55 : 0.9));
+  f.push("exposure=exposure=" + brightLift(y).toFixed(3));
+  f.push("eq=contrast=" + brightContrast(y).toFixed(3) + ":saturation=" + brightSat(y).toFixed(3) + ":gamma=" + (bright ? "1.0" : "0.97"));
+  f.push("colorbalance=rs=0.03:rm=0.05:bs=-0.03:bm=-0.05");
+  if (bright) f.push("curves=m='0/0 0.25/0.235 0.5/0.5 0.75/0.775 0.9/0.90 1/0.90'");
+  f.push("format=yuv420p");
+  return f.join(",");
+}
+
+function finishResult(blob, urlB, urlA, preUrl) {
+  blobOut = blob;
+  urlOut = preUrl || URL.createObjectURL(blob);
+  $("outVid").src = urlOut;
+  const cmpEl = $("cmp");
+  if (urlB && urlA) {
+    urlBefore = urlB;
+    urlAfter = urlA;
+    $("imgBefore").src = urlB;
+    $("imgAfter").src = urlA;
+    cmpEl.classList.remove("hidden");
+  } else {
+    cmpEl.classList.add("hidden");
+  }
+  const base = file.name.replace(/\.[^.]+$/, "");
+  $("dlBtn").href = urlOut;
+  $("dlBtn").download = "enhanced_" + base + ".mp4";
+  saveHistory($("dlBtn").download, blob);
+  renderHistory();
+  setBar(100, "Done");
+  progWrap.classList.add("hidden");
+  result.classList.remove("hidden");
+  result.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function run() {
+  if (!file || !meta) return;
+  goBtn.disabled = true;
+  drop.classList.add("hidden");
+  chip.classList.add("hidden");
+  logs = [];
+  if (TURBO && /\.(mp4|m4v|mov)$/i.test(file.name)) {
+    try {
+      if (!turboMod) turboMod = await import("./turbo.js");
+      const res = await turboMod.runTurbo(file, meta, {
+        bar: setBar,
+        log: line => logs.push(line),
+        analysis: m => {
+          const noisy = m && m.noise != null && m.noise >= 1.4;
+          logs.push("[analysis] luma=" + (m && m.y != null ? m.y.toFixed(1) : "?") + " noise=" + (m && m.noise != null ? m.noise.toFixed(2) : "?") + " path=" + (noisy ? "noisy" : "clean"));
+        }
+      });
+      finishResult(res.blob, null, null, null);
+      return;
+    } catch (e) {
+      logs.push("[turbo] fell back to quality engine: " + (e.message || e));
+      showStatus("Turbo engine hiccup — switching to the quality engine…", false);
+    }
+  }
+  try {
+    await ensureLoaded();
+
+    let hasLut = false;
+    try {
+      const r = await fetch(u("lut.cube"));
+      if (r.ok) {
+        await ffmpeg.writeFile("lut.cube", new Uint8Array(await r.arrayBuffer()));
+        hasLut = true;
+      }
+    } catch (e) {}
+
+    const ext = (file.name.split(".").pop() || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const inName = "input." + (ext || "mp4");
+    await ffmpeg.writeFile(inName, new Uint8Array(await file.arrayBuffer()));
+    setBar(25, "Video loaded");
+
+    const ss = meta.dur > 1.2 ? "1" : "0";
+    await exec(["-ss", ss, "-i", inName, "-frames:v", "1", "-q:v", "2", "before.jpg"], 30, "Extracting before frame…");
+
+    let m = null;
+    if (!hasLut) {
+      setBar(33, "Analyzing video… (grain + brightness)");
+      m = await measureSource(inName, meta.dur);
+      const noisy = m && m.noise != null && m.noise >= 1.4;
+      logs.push("[analysis] luma=" + (m ? m.y.toFixed(1) : "?") + " noise=" + (m && m.noise != null ? m.noise.toFixed(2) : "?") + " path=" + (noisy ? "noisy" : "clean"));
+      setBar(34, noisy ? "Grainy source detected — deeper cleanup engaged" : "Clean source detected — full sharpness engaged");
+    }
+    const vf = buildFilters(m, hasLut);
+
+    const args = ["-i", inName];
+    if (meta.dur > maxSeconds()) args.push("-t", String(maxSeconds()));
+    args.push(
+      "-vf", vf,
+      "-c:v", "libx264", "-preset", "faster", "-crf", "18",
+      "-threads", String(Math.min(8, navigator.hardwareConcurrency || 4)),
+      "-c:a", "aac", "-b:a", "320k",
+      "-movflags", "+faststart",
+      "out.mp4"
+    );
+    encoding = true;
+    setBar(35, "Enhancing… 0% — keep this tab open");
+    let rc = await ffmpeg.exec(args);
+    if (rc !== 0 && /vaguedenoiser/.test(vf) && logs.join("|").includes("No such filter")) {
+      logs.push("[retry] this engine lacks vaguedenoiser — retrying without it");
+      args[args.indexOf(vf)] = vf.split(",").filter(s => !s.startsWith("vaguedenoiser")).join(",");
+      setBar(35, "Retrying without advanced denoiser…");
+      rc = await ffmpeg.exec(args);
+    }
+    if (rc !== 0 && /minterpolate/.test(vf) && logs.join("|").includes("No such filter")) {
+      logs.push("[retry] this engine lacks minterpolate — retrying without smooth motion");
+      args[args.indexOf(vf)] = vf.split(",").filter(s => !s.startsWith("minterpolate")).join(",");
+      setBar(35, "Retrying without smooth motion…");
+      rc = await ffmpeg.exec(args);
+    }
+    encoding = false;
+    if (rc !== 0) throw new Error("ffmpeg exit code " + rc);
+
+    await exec(["-ss", ss, "-i", "out.mp4", "-frames:v", "1", "-q:v", "2", "after.jpg"], 93, "Extracting after frame…");
+
+    const data = await ffmpeg.readFile("out.mp4");
+    const bj = await ffmpeg.readFile("before.jpg");
+    const aj = await ffmpeg.readFile("after.jpg");
+    blobOut = new Blob([data], { type: "video/mp4" });
+    urlOut = URL.createObjectURL(blobOut);
+    urlBefore = URL.createObjectURL(new Blob([bj], { type: "image/jpeg" }));
+    urlAfter = URL.createObjectURL(new Blob([aj], { type: "image/jpeg" }));
+
+    finishResult(blobOut, urlBefore, urlAfter, urlOut);
+  } catch (err) {    encoding = false;
+    let msg = "Something went wrong: " + err.message;
+    if (/abort|OOM|memory|alloc/i.test(err.message || ""))
+      msg = "This clip is too big for your browser's memory. Try a shorter one (" + maxSeconds() + " s max recommended).";
+    showStatus(msg, true);
+    goBtn.disabled = false;
+  }
+}
+
+const cmp = $("cmp"), cmpAfter = $("cmpAfter"), cmpSlider = $("cmpSlider");
+cmpSlider.addEventListener("input", () => { cmpAfter.style.width = cmpSlider.value + "%"; });
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("enhance-history", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("clips", { keyPath: "id", autoIncrement: true });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+async function saveHistory(name, blob) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction("clips", "readwrite");
+    const st = tx.objectStore("clips");
+    const all = await new Promise((res, rej) => { const q = st.getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+    all.sort((a, b) => a.date - b.date);
+    let total = all.reduce((s, c) => s + (c.size || 0), 0);
+    while (all.length && (total + blob.size > 1.5e9 || all.length >= 5)) {
+      const old = all.shift();
+      total -= old.size || 0;
+      st.delete(old.id);
+    }
+    st.add({ name, date: Date.now(), blob, size: blob.size });
+  } catch (e) {}
+}
+
+async function renderHistory() {
+  try {
+    const db = await openDB();
+    const st = db.transaction("clips", "readonly").objectStore("clips");
+    const all = await new Promise((res, rej) => { const q = st.getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+    all.sort((a, b) => b.date - a.date);
+    const wrap = $("historyWrap"), list = $("historyList");
+    list.textContent = "";
+    wrap.classList.toggle("hidden", !all.length);
+    for (const c of all) {
+      const row = document.createElement("div");
+      row.className = "h-row";
+      const info = document.createElement("div");
+      info.className = "h-info";
+      info.textContent = c.name + " · " + new Date(c.date).toLocaleString() + " · " + (c.size / 1048576).toFixed(1) + " MB";
+      const a = document.createElement("a");
+      a.className = "h-dl";
+      a.textContent = "Download";
+      a.href = URL.createObjectURL(c.blob);
+      a.download = c.name;
+      const x = document.createElement("button");
+      x.className = "h-x";
+      x.textContent = "✕";
+      x.title = "Remove";
+      x.onclick = async () => {
+        const db2 = await openDB();
+        db2.transaction("clips", "readwrite").objectStore("clips").delete(c.id);
+        renderHistory();
+      };
+      row.append(info, a, x);
+      list.append(row);
+    }
+  } catch (e) {}
+}
+
+renderHistory();
+</script>
+</body>
+</html>
