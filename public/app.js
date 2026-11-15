@@ -1,10 +1,7 @@
 const $ = (id) => document.getElementById(id);
-const LS_KEY = "enhance-cloud-jobs-v1";
-const LIMITS = { max_mb: 450, capShort: 90, capLong: 180 };
-let jobs = [];
+let me = null;
+let pollTimer = null;
 let activeTab = "create";
-let turboMod = null;
-const prevStatus = new Map();
 
 function fmtSize(bytes) {
   if (!bytes || bytes < 1024) return "0 B";
@@ -28,18 +25,46 @@ function fmtDate(ts) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " · " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
 
-function loadJobs() {
-  try { jobs = JSON.parse(localStorage.getItem(LS_KEY) || "[]"); } catch { jobs = []; }
-  for (const j of jobs) {
-    if (j.url && j.url.startsWith("blob:")) {
-      j.status = "failed";
-      j.error = "This result link expired (device links don't survive a page reload). Run it again — it takes seconds.";
-    }
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let body = {};
+  try { body = await res.json(); } catch { }
+  if (!res.ok) {
+    if (body && body.error) throw new Error(body.error);
+    if (res.status === 401) throw new Error("not_signed_in");
+    if (res.status === 403) throw new Error("no_access");
+    throw new Error("Something went wrong. Try again.");
   }
+  return body;
 }
 
-function saveJobs() {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(jobs.slice(0, 30))); } catch { }
+function uploadXHR(file, filename, mode, onProgress) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("video", file, filename);
+    form.append("title", filename);
+    form.append("mode", mode);
+    form.append("look", document.getElementById("cinematicLook").checked ? "capcut" : "none");
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload", true);
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        onProgress(pct, e.loaded, e.total);
+      }
+    });
+    xhr.addEventListener("load", () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body);
+      } else {
+        reject(body && body.error ? new Error(body.error) : new Error("Upload failed."));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload lost connection. Check your Wi-Fi and try again.")));
+    xhr.send(form);
+  });
 }
 
 /* ————— Tabs ————— */
@@ -55,11 +80,11 @@ function initTabs() {
   document.querySelectorAll(".ap-tab").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
 }
 
-/* ————— Job rendering (diff-based: cards persist) ————— */
+/* ————— Job rendering (diff-based: cards persist across polls) ————— */
 
 function jobSig(j) {
-  return [j.status, j.status === "processing" ? Math.round(j.progress) : 0, j.error || "",
-    j.url || "", j.out_w || 0, j.output_size || 0, j.title || "", j.lane || ""].join("|");
+  return [j.status, j.status === "processing" ? Math.round(j.progress) : 0, j.queue_position || 0,
+    j.error || "", j.has_out ? 1 : 0, j.has_src ? 1 : 0, j.output_size || 0, j.title || ""].join("|");
 }
 
 function syncList(list, arr, builder) {
@@ -94,13 +119,14 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.add("hidden"), 4000);
 }
 
-function refresh() {
-  const active = jobs.filter((j) => j.status === "processing");
+function renderJobs(jobs) {
+  const active = jobs.filter((j) => j.status === "queued" || j.status === "processing");
   const finished = jobs.filter((j) => j.status === "done" || j.status === "failed");
 
+  // announce newly finished jobs
   for (const j of finished) {
     const prev = prevStatus.get(j.id);
-    if ((prev === "processing") && j.status === "done") {
+    if (prev === "processing" || prev === "queued") {
       toast(`"${(j.title || "video").slice(0, 28)}" is ready — scroll to Ready to download ↓`);
     }
     prevStatus.set(j.id, j.status);
@@ -112,20 +138,22 @@ function refresh() {
   syncList($("histList"), finished, doneCard);
 
   const latest = $("latestDone");
-  const latestDone = finished.find((j) => j.status === "done");
-  if (latestDone) {
-    syncList(latest, [latestDone], doneCard);
+  if (finished.length && finished[0].status === "done") {
+    syncList(latest, [finished[0]], doneCard);
     $("latestCard").classList.remove("hidden");
-  } else {
+  } else if (!finished.some((j) => j.status === "done")) {
     $("latestCard").classList.add("hidden");
-    latest.textContent = "";
   }
 
-  $("queuePill").textContent = active.length + " encoding";
+  const nProcessing = active.filter((j) => j.status === "processing").length;
+  const nQueued = active.length - nProcessing;
+  $("queuePill").textContent = nProcessing + " encoding" + (nQueued ? " · " + nQueued + " waiting" : "");
   $("queuePill").style.display = active.length ? "" : "none";
   $("histCountPill").textContent = finished.filter((j) => j.status === "done").length + " finished";
   $("histCountPill").style.display = finished.length ? "" : "none";
 }
+
+const prevStatus = new Map();
 
 function activeCard(job) {
   const div = document.createElement("div");
@@ -138,30 +166,38 @@ function activeCard(job) {
   title.className = "job-title";
   title.textContent = job.title || "video";
   const tag = document.createElement("span");
-  tag.className = "job-tag tag-processing";
-  tag.textContent = "ENCODING";
+  tag.className = "job-tag tag-" + job.status;
+  tag.textContent = { queued: "QUEUED", processing: "ENCODING" }[job.status] || job.status;
   const right = document.createElement("span");
   right.className = "job-right";
-  right.textContent = job.lane === "turbo" ? "on your device (GPU)" : "on the cloud";
   head.append(title, tag, right);
   div.appendChild(head);
 
-  const note = document.createElement("div");
-  note.className = "job-note";
-  note.textContent = job.lane === "turbo"
-    ? "Grading on your device (GPU Turbo) — keep this tab open"
-    : "Grading on the cloud server — keep this tab open";
-  div.appendChild(note);
-
-  const bar = document.createElement("div");
-  bar.className = "bar";
-  bar.innerHTML = `<div style="width:${Math.max(2, job.progress || 0).toFixed(1)}%"></div>`;
-  div.appendChild(bar);
-
-  const meta = document.createElement("div");
-  meta.className = "job-meta";
-  meta.textContent = `${(job.progress || 0).toFixed(0)}%${job.stage ? " · " + job.stage : ""}`;
-  div.appendChild(meta);
+  if (job.status === "queued") {
+    const note = document.createElement("div");
+    note.className = "job-note";
+    const pos = job.queue_position || 1;
+    note.textContent = `Waiting in queue · position ${pos} · starts in about ${fmtMs(job.est_ms * pos)}`;
+    div.appendChild(note);
+    const bar = document.createElement("div");
+    bar.className = "bar dim";
+    bar.innerHTML = `<div style="width:0%"></div>`;
+    div.appendChild(bar);
+  } else if (job.status === "processing") {
+    const note = document.createElement("div");
+    note.className = "job-note";
+    const modeName = { fast: "1080p Fast", best: "1080p Ultra-Best", fps120: "1080p 120fps" }[job.mode] || job.mode;
+    note.textContent = `Grading (${modeName}) · about ${fmtMs(job.est_ms)} total`;
+    div.appendChild(note);
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.innerHTML = `<div style="width:${job.progress.toFixed(1)}%"></div>`;
+    div.appendChild(bar);
+    const meta = document.createElement("div");
+    meta.className = "job-meta";
+    meta.textContent = `${job.progress.toFixed(0)}% · running on the server`;
+    div.appendChild(meta);
+  }
   return div;
 }
 
@@ -170,11 +206,12 @@ function activeCard(job) {
 function buildCompare(job, mount) {
   const cmp = document.createElement("div");
   cmp.className = "cmp";
+  const t = Math.max(0.3, ((job.duration_ms || 3000) / 1000) * 0.35).toFixed(2);
   const after = document.createElement("img");
   after.className = "cmp-after";
   after.draggable = false;
   after.alt = "Enhanced frame";
-  after.src = job.afterUrl;
+  after.src = `/api/files/${job.id}/frame/out?t=${t}`;
   const beforeWrap = document.createElement("div");
   beforeWrap.className = "cmp-before-wrap";
   beforeWrap.style.width = "50%";
@@ -182,7 +219,7 @@ function buildCompare(job, mount) {
   before.className = "cmp-before";
   before.draggable = false;
   before.alt = "Original frame";
-  before.src = job.beforeUrl;
+  before.src = `/api/files/${job.id}/frame/src?t=${t}`;
   beforeWrap.appendChild(before);
   const handle = document.createElement("div");
   handle.className = "cmp-handle";
@@ -254,14 +291,14 @@ function doneCard(job) {
   const meta0 = document.createElement("div");
   meta0.className = "job-meta";
   if (job.status !== "done") {
-    meta0.textContent = job.error || "Something went wrong during this render. Try again.";
+    meta0.textContent = "Something went wrong during this render. Try again — or pick a lower quality mode.";
     div.appendChild(meta0);
     return div;
   }
-  meta0.textContent = `Finished ${fmtDate(job.finished_at)} · link works for 24 hours${job.lane === "turbo" ? " · graded on your device" : " · graded on the cloud"}`;
+  meta0.textContent = `Finished ${fmtDate(job.finished_at)} · auto-deletes in ${fmtMs(job.expire_ms) || "12 hours"}`;
   div.appendChild(meta0);
 
-  if (job.url) {
+  if (job.has_out) {
     const view = document.createElement("div");
     view.className = "view-tabs";
     const btnPlayer = document.createElement("button");
@@ -277,13 +314,16 @@ function doneCard(job) {
     player.className = "preview";
     player.controls = true;
     player.preload = "metadata";
-    player.src = job.url;
-    if (job.afterUrl) player.poster = job.afterUrl;
+    player.src = `/api/files/${job.id}?inline=1`;
+    if (job.has_out) {
+      const t = Math.max(0.3, ((job.duration_ms || 3000) / 1000) * 0.35).toFixed(2);
+      player.poster = `/api/files/${job.id}/frame/out?t=${t}`;
+    }
     div.appendChild(player);
 
     const compareWrap = document.createElement("div");
     compareWrap.className = "compare-wrap hidden";
-    if (job.beforeUrl && job.afterUrl) buildCompare(job, compareWrap);
+    if (job.has_src && job.has_out) buildCompare(job, compareWrap);
     else compareWrap.innerHTML = `<div class="empty small">Compare preview isn't available for this one.</div>`;
     div.appendChild(compareWrap);
 
@@ -304,16 +344,27 @@ function doneCard(job) {
   row.className = "row";
   const dl = document.createElement("a");
   dl.className = "cta cta-sm";
-  dl.href = job.url;
-  dl.setAttribute("download", job.title ? "enhanced_" + job.title + ".mp4" : "enhanced.mp4");
-  if (!job.url.startsWith("blob:")) dl.setAttribute("target", "_blank");
+  dl.href = `/api/files/${job.id}`;
+  dl.setAttribute("download", "");
   dl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg><span>Download enhanced video</span>`;
   row.appendChild(dl);
   div.appendChild(row);
   return div;
 }
 
-/* ————— Picking a file ————— */
+async function refresh() {
+  try {
+    const data = await api("/api/jobs");
+    renderJobs(data.jobs || []);
+  } catch (err) {
+    if (String(err.message).includes("not_signed_in")) showLocked();
+  }
+}
+
+function showLocked() {
+  $("locked").classList.remove("hidden");
+  $("app").classList.add("hidden");
+}
 
 let pickedFile = null;
 
@@ -324,9 +375,10 @@ function setChip(file) {
   $("dropzone").classList.add("picked");
   $("dzTitle").textContent = "Ready";
   $("dzSub").textContent = "Different file? Remove this one first";
-  const tooBig = file.size > LIMITS.max_mb * 1048576;
+  const lims = me ? me.limits : null;
+  const tooBig = lims && file.size > lims.max_mb * 1048576;
   $("goBtn").disabled = tooBig;
-  $("goBtn").querySelector("span").textContent = tooBig ? `Too big — max ${LIMITS.max_mb} MB` : "Enhance video";
+  $("goBtn").querySelector("span").textContent = tooBig ? `Too big — max ${lims.max_mb} MB` : "Enhance video";
 }
 
 function clearChip() {
@@ -339,208 +391,59 @@ function clearChip() {
   $("goBtn").querySelector("span").textContent = "Enhance video";
 }
 
-function probeFile(file) {
-  return new Promise((res, rej) => {
-    const v = document.createElement("video");
-    v.preload = "metadata";
-    v.onloadedmetadata = () => {
-      const r = { dur: v.duration, w: v.videoWidth, h: v.videoHeight };
-      URL.revokeObjectURL(v.src);
-      res(r);
-    };
-    v.onerror = () => { URL.revokeObjectURL(v.src); rej(new Error("Couldn't read that video — try MP4 or MOV.")); };
-    v.src = URL.createObjectURL(file);
-  });
-}
-
-const TURBO = (function () {
-  try {
-    return "VideoDecoder" in window && "VideoEncoder" in window && "AudioEncoder" in window &&
-      !!document.createElement("canvas").getContext("webgl2");
-  } catch (e) { return false; }
-})();
-
-/* ————— The job ————— */
-
-function updateJobUI(job) {
-  const bar = $("uploadBar");
-  const meta = $("uploadMeta");
-  if (bar) bar.style.width = Math.max(0, Math.min(100, job.progress || 0)) + "%";
-  if (meta) meta.textContent = job.stage || "Working…";
-}
-
-function finishJob(job, blob, dims) {
-  job.status = "done";
-  job.finished_at = Date.now();
-  job.url = URL.createObjectURL(blob);
-  job.output_size = blob.size;
-  job.out_w = dims ? dims.outW : null;
-  job.out_h = dims ? dims.outH : null;
-  saveJobs();
-  refresh();
-}
-
-async function runJob() {
+async function startUpload() {
   if (!pickedFile) return;
   const mode = document.querySelector('input[name=mode]:checked').value;
   $("goBtn").disabled = true;
   $("goBtn").querySelector("span").textContent = "Working…";
   $("uploadProgressWrap").classList.remove("hidden");
-
-  const job = {
-    id: "j" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    title: pickedFile.name.replace(/\.[^.]+$/, "").slice(0, 40),
-    mode,
-    lane: null,
-    status: "processing",
-    progress: 0,
-    stage: "Reading video…",
-    created: Date.now(),
-    logs: []
-  };
-  jobs.unshift(job);
-  saveJobs();
-  refresh();
-
   try {
-    const meta = await probeFile(pickedFile);
-    if (!meta.w || !meta.h || !meta.dur) throw new Error("Couldn't read the video dimensions.");
-
-    const turboEligible = TURBO && /\.(mp4|m4v|mov)$/i.test(pickedFile.name) && meta.dur <= LIMITS.capLong * 2;
-    if (turboEligible) {
-      job.lane = "turbo";
-      job.stage = "GPU Turbo — grading on your device";
-      refresh();
-      try {
-        if (!turboMod) turboMod = await import("./turbo.js");
-        const res = await turboMod.runTurbo(pickedFile, meta, {
-          bar: () => { },
-          log: (l) => { job.logs.push(l); },
-          analysis: (m) => { job.logs.push("[analysis] " + JSON.stringify(m)); }
-        });
-        job.beforeUrl = res.beforeUrl || null;
-        job.afterUrl = res.afterUrl || null;
-        finishJob(job, res.blob, { outW: res.outW, outH: res.outH });
-        clearChip();
-        return;
-      } catch (e) {
-        job.logs.push("[turbo-fallback] " + (e.message || e));
-        job.lane = null;
-        job.stage = "Switching to the cloud…";
-        refresh();
-      }
-    }
-
-    job.lane = "cloud";
-    job.stage = "Uploading to the cloud…";
-    job.progress = 2;
-    refresh();
-
-    let mod;
-    try {
-      mod = await import("https://esm.sh/@vercel/blob@1.1.1/client");
-    } catch (e) {
-      throw new Error("Upload module failed to load — check your connection and retry.");
-    }
-    const pathname = "inputs/" + Date.now().toString(36) + "-" + pickedFile.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const { url: blobUrl } = await mod.upload(pickedFile, {
-      access: "public",
-      handleUploadUrl: "./api/upload",
-      pathname,
+    await uploadXHR(pickedFile, pickedFile.name, mode, (pct) => {
+      $("uploadBar").style.width = pct + "%";
+      $("uploadMeta").textContent = `Uploading… ${pct}%`;
     });
-    job.progress = 20;
-    job.stage = "Grading on the cloud…";
-    updateJobUI(job);
-    refresh();
-
-    const r = await fetch("./api/enhance", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ blobUrl, w: meta.w, h: meta.h, dur: meta.dur, name: pickedFile.name })
-    });
-    if (!r.ok || !r.body) throw new Error("Server error (HTTP " + r.status + ")");
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "", out = null;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let ix;
-      while ((ix = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, ix).trim();
-        buf = buf.slice(ix + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.type === "progress") {
-          job.progress = Math.min(97, msg.pct * 0.99);
-          job.stage = msg.label || "Grading on the cloud…";
-          updateJobUI(job);
-          refresh();
-        } else if (msg.type === "log") {
-          job.logs.push(msg.line);
-        } else if (msg.type === "analysis") {
-          job.analysis = msg;
-          job.logs.push("[analysis] " + JSON.stringify(msg));
-        } else if (msg.type === "done") {
-          out = msg;
-        } else if (msg.type === "error") {
-          throw new Error(msg.message);
-        }
-      }
-    }
-    if (!out) throw new Error("The server closed without a result.");
-
-    job.status = "done";
-    job.finished_at = Date.now();
-    job.url = out.url;
-    job.beforeUrl = out.beforeUrl;
-    job.afterUrl = out.afterUrl;
-    job.out_w = out.outW;
-    job.out_h = out.outH;
-    job.lane = "cloud";
-    saveJobs();
-    refresh();
     clearChip();
-
+    await refresh();
+    poll();
   } catch (err) {
-    job.status = "failed";
-    job.error = String(err.message || err);
-    job.finished_at = Date.now();
-    saveJobs();
-    refresh();
-    toast("Something went wrong: " + (err.message || err));
+    alert(String(err.message || err));
   } finally {
     $("uploadProgressWrap").classList.add("hidden");
     $("uploadBar").style.width = "0%";
-    $("goBtn").disabled = !pickedFile;
-    $("goBtn").querySelector("span").textContent = "Enhance video";
+    if (pickedFile) {
+      $("goBtn").disabled = false;
+      $("goBtn").querySelector("span").textContent = "Enhance video";
+    }
   }
 }
 
-function radioInit() {
-  const upd = () => {
-    const v = document.querySelector('input[name=mode]:checked').value;
-    $("segHint").textContent = v === "fast"
-      ? (TURBO ? "GPU Turbo on your device when possible — cloud server otherwise" : "Cloud server — fast turnaround, great quality")
-      : "";
-  };
-  document.querySelectorAll("#modeRow input").forEach((inp) => inp.addEventListener("change", upd));
-  upd();
+function poll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refresh, 4000);
 }
 
-function init() {
+async function init() {
+  try {
+    me = await api("/api/me");
+  } catch (err) {
+    const msg = String(err.message || "");
+    if (msg.includes("not_signed_in") || msg.includes("no_access")) {
+      showLocked();
+      return;
+    }
+    $("locked").classList.remove("hidden");
+    $("locked").querySelector("p").textContent = "The video server is not running. Start it and refresh.";
+    return;
+  }
   $("app").classList.remove("hidden");
-  $("limMb").textContent = LIMITS.max_mb;
-  $("limMin").textContent = LIMITS.capShort + "s clip (180s at 1080p)";
+  $("limMb").textContent = me.limits.max_mb;
+  $("limMin").textContent = me.limits.max_minutes;
   initTabs();
   radioInit();
 
   const fi = $("fileInput");
   const dz = $("dropzone");
   dz.addEventListener("click", () => fi.click());
-  dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") fi.click(); });
   dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("hover"); });
   dz.addEventListener("dragleave", () => dz.classList.remove("hover"));
   dz.addEventListener("drop", (e) => {
@@ -558,16 +461,33 @@ function init() {
     }
   });
   $("chipRemove").addEventListener("click", clearChip);
-  $("goBtn").addEventListener("click", () => { if (pickedFile) runJob(); });
-  $("cinematicLook").addEventListener("change", (e) => {
-    if (!e.target.checked) {
-      e.target.checked = true;
-      toast("The cinematic look is always on — it's what makes this thing work.");
-    }
-  });
+  $("goBtn").addEventListener("click", () => { if (pickedFile) startUpload(); });
 
-  loadJobs();
-  refresh();
+  await refresh();
+  poll();
+}
+
+function radioInit() {
+  const modes = me.modes || [];
+  const SHORT = { fast: "Fast", best: "Ultra", fps120: "120fps" };
+  const HINT = {
+    fast: "Fastest turnaround, great quality",
+    best: "Maximum quality, slower to make",
+    fps120: "Ultra smooth motion, slow to make",
+  };
+  const inputs = $("modeRow").querySelectorAll(".seg-item input");
+  inputs.forEach((inp, i) => {
+    const m = modes[i];
+    if (!m) return;
+    inp.value = m.id;
+    inp.nextElementSibling.textContent = SHORT[m.id] || m.name;
+  });
+  const upd = () => {
+    const v = document.querySelector('input[name=mode]:checked').value;
+    $("segHint").textContent = HINT[v] || v;
+  };
+  inputs.forEach((inp) => inp.addEventListener("change", upd));
+  upd();
 }
 
 init();
